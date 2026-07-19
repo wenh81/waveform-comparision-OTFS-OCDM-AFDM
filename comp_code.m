@@ -131,30 +131,22 @@ function results = run_ocdm_simulation(params)
             x = randi([0 params.M-1], N, 1);
             bits_tx = de2bi(x, params.bits_in_sym, 'left-msb');
             s_qam = qammod(x, params.M, 'UnitAveragePower', true);
-            s_ocdm = IFSnT * s_qam;  % Fresnel transform
-            
-            % Add CP
-            s_cp = [s_ocdm(N-cp_len+1:N); s_ocdm];  % Cyclic prefix: (N+cp_len)x1
+            s_ocdm = IFSnT * s_qam;  % Fresnel transform: N×1
             
             % Channel (N×N)
             [H, ~, ~, ~, ~, ~] = NTN_channels( ...
                 params.K, params.L, params.df, ...
                 params.max_doppler, params.channel_type);
             
-            % AWGN
+            % Process signal through channel
+            r_received = H * s_ocdm;  % N×1
+            
+            % Add AWGN with correct dimensions (N×1, not CP extended)
             w = sqrt(N0/2) * (randn(N, 1) + 1j*randn(N, 1));
-            
-            % Channel effect on CP signal via circular convolution approximation
-            % Process the received signal through channel (first N samples)
-            r_received = H * s_ocdm;
-            r_cp = [r_received(N-cp_len+1:N); r_received];
-            r_cp = r_cp + [w; w];  % Add noise properly
-            
-            % Remove CP
-            r = r_cp(cp_len+1:cp_len+N);
+            r_received = r_received + w;
             
             % Fresnel domain
-            r_ocdm = FSnT * r;
+            r_ocdm = FSnT * r_received;
             
             % Effective channel in Fresnel domain
             D = FSnT * H * IFSnT;
@@ -227,11 +219,8 @@ function results = run_afdm_simulation(params)
             x = randi([0 params.M-1], N, 1);
             bits_tx = de2bi(x, params.bits_in_sym, 'left-msb');
             y = qammod(x, params.M, 'UnitAveragePower', true);
-            s = AH * y;  % IDAFT
+            s = AH * y;  % IDAFT: N×1
             s = s / sqrt(mean(abs(s).^2));
-            
-            % Add CP
-            s_cp = [s(N-cp_len+1:N); s];  % (N+cp_len)x1
             
             % Channel
             [HT, ~, ~, ~, ~, ~] = NTN_channels( ...
@@ -239,19 +228,15 @@ function results = run_afdm_simulation(params)
                 params.max_doppler, params.channel_type);
             HT = HT / sqrt(trace(HT*HT')/N);
             
-            % AWGN
+            % Process signal through channel
+            r_received = HT * s;  % N×1
+            
+            % Add AWGN with correct dimensions
             w = sqrt(N0/2) * (randn(N, 1) + 1j*randn(N, 1));
-            
-            % Channel effect
-            r_received = HT * s;
-            r_cp = [r_received(N-cp_len+1:N); r_received];
-            r_cp = r_cp + [w; w];  % Add noise
-            
-            % Remove CP
-            r_time = r_cp(cp_len+1:cp_len+N);
+            r_received = r_received + w;
             
             % DAFT domain
-            Y = A * r_time;
+            Y = A * r_received;
             H_daft = A * HT * AH;
             H_daft = H_daft / sqrt(trace(H_daft*H_daft')/N);
             
@@ -321,11 +306,6 @@ function results = run_otfs_simulation(params)
             % IFFT for OTFS precoding
             x_time = ifft(reshape(x, N, M), N, 1) * sqrt(N);
             x_time = reshape(x_time, S, 1);
-            
-            % Reshape to 2D for CP addition
-            x_2d = reshape(x_time, N, M);
-            x_cp_2d = [x_2d(N-cp_len+1:N, :); x_2d];  % (N+cp_len)×M
-            x_cp = reshape(x_cp_2d, (N+cp_len)*M, 1);
             
             % Channel
             [HT, ~, ~, ~, ~, ~] = NTN_channels( ...
@@ -465,11 +445,11 @@ function print_performance_summary(results, params)
     
     for s = 1:length(systems)
         sys = systems{s};
+        [best_ber_l, idx_l] = min(results.(sys).ber_lmmse);
+        [best_ber_s, idx_s] = min(results.(sys).ber_mmsesd);
         fprintf('%s:\n', names{s});
-        fprintf('  LMMSE  - Best BER: %.3e at SNR=%d dB\n', ...
-            min(results.(sys).ber_lmmse), params.SNR_dB(find(results.(sys).ber_lmmse == min(results.(sys).ber_lmmse), 1)));
-        fprintf('  MMSE-SD- Best BER: %.3e at SNR=%d dB\n\n', ...
-            min(results.(sys).ber_mmsesd), params.SNR_dB(find(results.(sys).ber_mmsesd == min(results.(sys).ber_mmsesd), 1)));
+        fprintf('  LMMSE  - Best BER: %.3e at SNR=%d dB\n', best_ber_l, params.SNR_dB(idx_l));
+        fprintf('  MMSE-SD- Best BER: %.3e at SNR=%d dB\n\n', best_ber_s, params.SNR_dB(idx_s));
     end
     
     fprintf('================================================================================\n\n');
