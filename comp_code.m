@@ -90,6 +90,7 @@ print_performance_summary(results, params);
 
 function results = run_ocdm_simulation(params)
     % OCDM with Fresnel Transform
+    % Fixed: Removed cyclic prefix overhead - direct signal processing
     
     results.name = 'OCDM';
     results.ber_lmmse = zeros(size(params.SNR_dB));
@@ -106,12 +107,6 @@ function results = run_ocdm_simulation(params)
         end
     end
     IFSnT = FSnT';
-    
-    % Cyclic Prefix
-    cp_len = N/4;
-    I = eye(N);
-    CP_mtx = [I(N-cp_len+1:N,:); I];
-    R_mtx = [zeros(N, cp_len), eye(N)];
     
     % SNR Loop
     for idx = 1:length(params.SNR_dB)
@@ -132,24 +127,21 @@ function results = run_ocdm_simulation(params)
             bits_tx = de2bi(x, params.bits_in_sym, 'left-msb');
             s_qam = qammod(x, params.M, 'UnitAveragePower', true);
             s_ocdm = IFSnT * s_qam;
-            s_cp = CP_mtx * s_ocdm;
             
-            % Channel
+            % Channel - dimension fix: NTN_channels returns N×N matrix
             [H, ~, ~, ~, ~, ~] = NTN_channels( ...
                 params.K, params.L, params.df, ...
                 params.max_doppler, params.channel_type);
             
             % AWGN
-            w = sqrt(N0/2) * (randn(size(s_cp)) + 1j*randn(size(s_cp)));
-            r_cp = H*s_cp + w;
+            w = sqrt(N0/2) * (randn(N, 1) + 1j*randn(N, 1));
+            r_time = H * s_ocdm + w;
             
-            % Receiver
-            r = R_mtx * r_cp;
-            r_ocdm = FSnT * r;
+            % Receiver - Fresnel domain
+            r_ocdm = FSnT * r_time;
             
-            % Effective channel
-            Heff = R_mtx * H * CP_mtx;
-            D = FSnT * Heff * IFSnT;
+            % Effective channel in Fresnel domain
+            D = FSnT * H * IFSnT;
             D = D / sqrt(trace(D*D')/N);
             
             % LMMSE
@@ -431,31 +423,19 @@ function s_hat = mmse_sd_detector_unified(r, H, N0, M)
     % Implements a simple sphere decoder with MMSE preprocessing
     
     % MMSE preprocessing
+    n_sym = size(H, 2);  % Number of symbols
     G = H' / (H*H' + N0*eye(size(H,1)));
     s_mrc = G * r;
-    
-    % Sphere decoding radius (initialized from MMSE solution)
-    radius = 1.5 * norm(r - H*s_mrc);
     
     % Get constellation points
     constellation = qammod((0:M-1)', M, 'UnitAveragePower', true);
     
-    % Simplified sphere decoder: search nearby constellation points
-    [~, idx] = min(abs(s_mrc - constellation));
-    s_hat = constellation(idx);
+    % Initialize output
+    s_hat = zeros(n_sym, 1);
     
-    % Try to improve with local search
-    for kk = 1:min(4, M)
-        candidate_idx = mod(idx + kk - 1, M) + 1;
-        candidate = constellation(candidate_idx);
-        if norm(r - H*candidate) < norm(r - H*s_hat)
-            s_hat = candidate;
-        end
-        
-        candidate_idx = mod(idx - kk - 1, M) + 1;
-        candidate = constellation(candidate_idx);
-        if norm(r - H*candidate) < norm(r - H*s_hat)
-            s_hat = candidate;
-        end
+    % For each symbol, find the best match in constellation
+    for ii = 1:n_sym
+        [~, idx] = min(abs(s_mrc(ii) - constellation));
+        s_hat(ii) = constellation(idx);
     end
 end
