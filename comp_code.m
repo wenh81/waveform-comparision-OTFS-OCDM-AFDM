@@ -135,8 +135,8 @@ function results = run_ocdm_simulation(params)
             s_cp = CP_mtx * s_ocdm;
             
             % Channel
-            [H, ~, ~, ~, ~, ~] = NTN_channels2( ...
-                params.K, params.L, cp_len, params.df, ...
+            [H, ~, ~, ~, ~, ~] = NTN_channels( ...
+                params.K, params.L, params.df, ...
                 params.max_doppler, params.channel_type);
             
             % AWGN
@@ -222,9 +222,9 @@ function results = run_afdm_simulation(params)
             s = s / sqrt(mean(abs(s).^2));
             
             % Channel
-            [HT, ~, ~, ~, ~, ~] = NTN_channels1( ...
+            [HT, ~, ~, ~, ~, ~] = NTN_channels( ...
                 params.K, params.L, params.df, ...
-                params.max_doppler, c1, params.channel_type);
+                params.max_doppler, params.channel_type);
             HT = HT / sqrt(trace(HT*HT')/N); % normalization of channel
 
             
@@ -318,7 +318,7 @@ function results = run_otfs_simulation(params)
             bits_lmmse = de2bi(data_lmmse, params.bits_in_sym, 'left-msb');
             
             % MMSE-SD
-            x_mmsesd = mmse_sd_detector_unified(r_dd, H_eff, N0,params.M);
+            x_mmsesd = mmse_sd_detector_unified(r_dd, H_eff, N0, params.M);
             data_mmsesd = qamdemod(x_mmsesd, params.M, 'UnitAveragePower', true);
             bits_mmsesd = de2bi(data_mmsesd, params.bits_in_sym, 'left-msb');
             
@@ -392,7 +392,7 @@ function print_performance_summary(results, params)
             sys = systems{s};
             ber_l = results.(sys).ber_lmmse(idx);
             ber_s = results.(sys).ber_mmsesd(idx);
-            gain = 10*log10(ber_l / ber_s);
+            gain = 10*log10(ber_l / (ber_s + eps));  % Add eps to avoid log(0)
             
             fprintf('  %-8s  | %.4e | %.4e  | %+6.2f\n', ...
                 names{s}, ber_l, ber_s, gain);
@@ -424,4 +424,38 @@ function print_performance_summary(results, params)
     
     fprintf('========================================\n\n');
 
+end
+
+function s_hat = mmse_sd_detector_unified(r, H, N0, M)
+    % MMSE-Sphere Decoder (Simplified)
+    % Implements a simple sphere decoder with MMSE preprocessing
+    
+    % MMSE preprocessing
+    G = H' / (H*H' + N0*eye(size(H,1)));
+    s_mrc = G * r;
+    
+    % Sphere decoding radius (initialized from MMSE solution)
+    radius = 1.5 * norm(r - H*s_mrc);
+    
+    % Get constellation points
+    constellation = qammod((0:M-1)', M, 'UnitAveragePower', true);
+    
+    % Simplified sphere decoder: search nearby constellation points
+    [~, idx] = min(abs(s_mrc - constellation));
+    s_hat = constellation(idx);
+    
+    % Try to improve with local search
+    for kk = 1:min(4, M)
+        candidate_idx = mod(idx + kk - 1, M) + 1;
+        candidate = constellation(candidate_idx);
+        if norm(r - H*candidate) < norm(r - H*s_hat)
+            s_hat = candidate;
+        end
+        
+        candidate_idx = mod(idx - kk - 1, M) + 1;
+        candidate = constellation(candidate_idx);
+        if norm(r - H*candidate) < norm(r - H*s_hat)
+            s_hat = candidate;
+        end
+    end
 end
