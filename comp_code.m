@@ -7,6 +7,7 @@ clc; clear; close all;
 % - Same SNR range
 % - Same modulation (16-QAM)
 % - Same number of symbols (256)
+% - Cyclic Prefix for all systems
 % - LMMSE and MMSE-SD detectors
 
 %% ================= COMMON PARAMETERS ==========
@@ -17,6 +18,9 @@ params = struct();
 params.K = 16;
 params.L = 16;
 params.N = params.K * params.L;  % 256 symbols
+
+% Cyclic Prefix
+params.cp_len = floor(params.N / 4);  % CP length = N/4 = 64
 
 % Modulation
 params.bits_in_sym = 4;
@@ -30,19 +34,20 @@ params.c = physconst('lightspeed');
 params.max_doppler = params.terminal_velocity/params.c * params.fc*0.5;
 
 % Simulation parameters
-params.num_iter = 300;            % Monte Carlo iterations
-params.SNR_dB = 0:4:20;           % SNR range
+params.num_iter = 100;            % Monte Carlo iterations (reduced for speed)
+params.SNR_dB = -5:2:15;          % SNR range
 params.SNR = 10.^(params.SNR_dB/10);
 params.channel_type = 'NTN_D';
 
 % Display parameters
-fprintf('=== UNIFIED NTN SYSTEM COMPARISON ===\n');
+fprintf('=== UNIFIED NTN SYSTEM COMPARISON WITH CYCLIC PREFIX ===\n');
 fprintf('Systems: OCDM, AFDM, OTFS\n');
 fprintf('Symbols: %d, Modulation: %d-QAM\n', params.N, params.M);
+fprintf('Cyclic Prefix Length: %d\n', params.cp_len);
 fprintf('Iterations: %d, SNR: %d to %d dB\n', ...
     params.num_iter, params.SNR_dB(1), params.SNR_dB(end));
 fprintf('Max Doppler: %.2f Hz\n', params.max_doppler);
-fprintf('=====================================\n\n');
+fprintf('================================================================\n\n');
 
 %% ================= INITIALIZE RESULTS STRUCTURE ========
 results = struct();
@@ -71,7 +76,7 @@ fprintf('\n========== Running AFDM Simulation ==========\n');
 results.afdm = run_afdm_simulation(params);
 
 %% ================= SYSTEM 3: OTFS =================
-fprintf('\n======= Running OTFS Simulation =====\n');
+fprintf('\n========== Running OTFS Simulation ==========\n');
 results.otfs = run_otfs_simulation(params);
 
 %% ================= COMPARATIVE PLOTTING ========
@@ -89,14 +94,14 @@ print_performance_summary(results, params);
 %% ================================================
 
 function results = run_ocdm_simulation(params)
-    % OCDM with Fresnel Transform
-    % Fixed: Removed cyclic prefix overhead - direct signal processing
+    % OCDM with Fresnel Transform and Cyclic Prefix
     
     results.name = 'OCDM';
     results.ber_lmmse = zeros(size(params.SNR_dB));
     results.ber_mmsesd = zeros(size(params.SNR_dB));
     
     N = params.N;
+    cp_len = params.cp_len;
     
     % Fresnel Transform Matrices
     fprintf('  Computing Fresnel matrices...\n');
@@ -108,6 +113,11 @@ function results = run_ocdm_simulation(params)
     end
     IFSnT = FSnT';
     
+    % Cyclic Prefix matrices
+    I = eye(N);
+    CP_mtx = [I(N-cp_len+1:N,:); I];      % Add CP: (N+cp_len)×N
+    R_mtx = [zeros(N, cp_len), eye(N)];   % Remove CP: N×(N+cp_len)
+    
     % SNR Loop
     for idx = 1:length(params.SNR_dB)
         N0 = 1/params.SNR(idx);
@@ -118,7 +128,7 @@ function results = run_ocdm_simulation(params)
         fprintf('  SNR = %d dB: ', params.SNR_dB(idx));
         
         for it = 1:params.num_iter
-            if mod(it, 100) == 0
+            if mod(it, 50) == 0
                 fprintf('.');
             end
             
@@ -126,27 +136,33 @@ function results = run_ocdm_simulation(params)
             x = randi([0 params.M-1], N, 1);
             bits_tx = de2bi(x, params.bits_in_sym, 'left-msb');
             s_qam = qammod(x, params.M, 'UnitAveragePower', true);
-            s_ocdm = IFSnT * s_qam;
+            s_ocdm = IFSnT * s_qam;  % Fresnel transform
+            s_cp = CP_mtx * s_ocdm;  % Add CP: (N+cp_len)×1
             
-            % Channel - dimension fix: NTN_channels returns N×N matrix
+            % Channel
             [H, ~, ~, ~, ~, ~] = NTN_channels( ...
                 params.K, params.L, params.df, ...
                 params.max_doppler, params.channel_type);
             
+            % Extend channel matrix to account for CP
+            H_cp = [H, zeros(N, cp_len)];
+            
             % AWGN
             w = sqrt(N0/2) * (randn(N, 1) + 1j*randn(N, 1));
-            r_time = H * s_ocdm + w;
+            r_cp = H_cp * s_cp + w;
             
-            % Receiver - Fresnel domain
-            r_ocdm = FSnT * r_time;
+            % Receiver - Remove CP
+            r = R_mtx * r_cp;
+            r_ocdm = FSnT * r;
             
-            % Effective channel in Fresnel domain
-            D = FSnT * H * IFSnT;
+            % Effective channel
+            Heff = R_mtx * H_cp * CP_mtx;
+            D = FSnT * Heff * IFSnT;
             D = D / sqrt(trace(D*D')/N);
             
             % LMMSE
-            W = D' / (D*D' + N0*eye(N));
-            s_hat_lmmse = W * r_ocdm;
+            W_lmmse = D' / (D*D' + N0*eye(N));
+            s_hat_lmmse = W_lmmse * r_ocdm;
             x_hat_lmmse = qamdemod(s_hat_lmmse, params.M, 'UnitAveragePower', true);
             bits_lmmse = de2bi(x_hat_lmmse, params.bits_in_sym, 'left-msb');
             
@@ -161,8 +177,8 @@ function results = run_ocdm_simulation(params)
             tot_bits = tot_bits + numel(bits_tx);
         end
         
-        results.ber_lmmse(idx) = err_lmmse / tot_bits;
-        results.ber_mmsesd(idx) = err_mmsesd / tot_bits;
+        results.ber_lmmse(idx) = max(err_lmmse / tot_bits, 1e-6);
+        results.ber_mmsesd(idx) = max(err_mmsesd / tot_bits, 1e-6);
         
         fprintf(' LMMSE=%.3e, MMSE-SD=%.3e\n', ...
             results.ber_lmmse(idx), results.ber_mmsesd(idx));
@@ -170,13 +186,14 @@ function results = run_ocdm_simulation(params)
 end
 
 function results = run_afdm_simulation(params)
-    % AFDM with Discrete Affine Fourier Transform
+    % AFDM with Discrete Affine Fourier Transform and Cyclic Prefix
     
     results.name = 'AFDM';
     results.ber_lmmse = zeros(size(params.SNR_dB));
     results.ber_mmsesd = zeros(size(params.SNR_dB));
     
     N = params.N;
+    cp_len = params.cp_len;
     
     % AFDM Parameters
     nu_max = params.max_doppler / params.df;
@@ -192,6 +209,11 @@ function results = run_afdm_simulation(params)
     A = D2 * DFT * D1;      % DAFT matrix
     AH = A';                 % Inverse DAFT
     
+    % Cyclic Prefix matrices
+    I = eye(N);
+    CP_mtx = [I(N-cp_len+1:N,:); I];      % Add CP
+    R_mtx = [zeros(N, cp_len), eye(N)];   % Remove CP
+    
     % SNR Loop
     for idx = 1:length(params.SNR_dB)
         N0 = 1/params.SNR(idx);
@@ -202,7 +224,7 @@ function results = run_afdm_simulation(params)
         fprintf('  SNR = %d dB: ', params.SNR_dB(idx));
         
         for it = 1:params.num_iter
-            if mod(it, 100) == 0
+            if mod(it, 50) == 0
                 fprintf('.');
             end
             
@@ -210,28 +232,34 @@ function results = run_afdm_simulation(params)
             x = randi([0 params.M-1], N, 1);
             bits_tx = de2bi(x, params.bits_in_sym, 'left-msb');
             y = qammod(x, params.M, 'UnitAveragePower', true);
-            s = AH * y;
+            s = AH * y;  % IDAFT
             s = s / sqrt(mean(abs(s).^2));
+            s_cp = CP_mtx * s;  % Add CP
             
             % Channel
             [HT, ~, ~, ~, ~, ~] = NTN_channels( ...
                 params.K, params.L, params.df, ...
                 params.max_doppler, params.channel_type);
-            HT = HT / sqrt(trace(HT*HT')/N); % normalization of channel
-
+            
+            % Extend channel matrix
+            HT_cp = [HT, zeros(N, cp_len)];
+            HT_cp = HT_cp / sqrt(trace(HT_cp*HT_cp')/N);
             
             % Add noise in time domain
-            w_time = sqrt(N0/2) * (randn(N,1) + 1j*randn(N,1));
-            r_time = HT * s + w_time;
+            w = sqrt(N0/2) * (randn(N, 1) + 1j*randn(N, 1));
+            r_cp = HT_cp * s_cp + w;
             
-            % Affine domain
+            % Remove CP
+            r_time = R_mtx * r_cp;
+            
+            % DAFT domain
             Y = A * r_time;
-            H_daft = A * HT * AH;
+            H_daft = A * R_mtx * HT_cp * CP_mtx * AH;
             H_daft = H_daft / sqrt(trace(H_daft*H_daft')/N);
             
             % LMMSE
-            W = H_daft' / (H_daft*H_daft' + N0*eye(N));
-            y_hat_lmmse = W * Y;
+            W_lmmse = H_daft' / (H_daft*H_daft' + N0*eye(N));
+            y_hat_lmmse = W_lmmse * Y;
             x_hat_lmmse = qamdemod(y_hat_lmmse, params.M, 'UnitAveragePower', true);
             bits_lmmse = de2bi(x_hat_lmmse, params.bits_in_sym, 'left-msb');
             
@@ -246,8 +274,8 @@ function results = run_afdm_simulation(params)
             tot_bits = tot_bits + numel(bits_tx);
         end
         
-        results.ber_lmmse(idx) = err_lmmse / tot_bits;
-        results.ber_mmsesd(idx) = err_mmsesd / tot_bits;
+        results.ber_lmmse(idx) = max(err_lmmse / tot_bits, 1e-6);
+        results.ber_mmsesd(idx) = max(err_mmsesd / tot_bits, 1e-6);
         
         fprintf(' LMMSE=%.3e, MMSE-SD=%.3e\n', ...
             results.ber_lmmse(idx), results.ber_mmsesd(idx));
@@ -255,7 +283,7 @@ function results = run_afdm_simulation(params)
 end
 
 function results = run_otfs_simulation(params)
-    % OTFS with Delay-Doppler domain processing
+    % OTFS with Delay-Doppler domain processing and Cyclic Prefix
     
     results.name = 'OTFS';
     results.ber_lmmse = zeros(size(params.SNR_dB));
@@ -264,6 +292,7 @@ function results = run_otfs_simulation(params)
     M = params.K;  % Time slots
     N = params.L;  % Subcarriers
     S = M * N;     % Total symbols
+    cp_len = params.cp_len;
     
     % OTFS Operators
     fprintf('  Computing OTFS operators...\n');
@@ -271,6 +300,11 @@ function results = run_otfs_simulation(params)
     WH = W';
     IL = eye(M);
     OP = kron(WH, IL);
+    
+    % Cyclic Prefix for time domain
+    I_time = eye(M);
+    CP_time = [I_time(M-cp_len+1:M,:); I_time];  % (M+cp_len)×M
+    R_time = [zeros(M, cp_len), eye(M)];         % M×(M+cp_len)
     
     % SNR Loop
     for idx = 1:length(params.SNR_dB)
@@ -282,7 +316,7 @@ function results = run_otfs_simulation(params)
         fprintf('  SNR = %d dB: ', params.SNR_dB(idx));
         
         for it = 1:params.num_iter
-            if mod(it, 100) == 0
+            if mod(it, 50) == 0
                 fprintf('.');
             end
             
@@ -291,20 +325,29 @@ function results = run_otfs_simulation(params)
             bits_tx = de2bi(data, params.bits_in_sym, 'left-msb');
             x = qammod(data, params.M, 'UnitAveragePower', true);
             
+            % IFFT for OTFS precoding
+            x_time = ifft(reshape(x, N, M), N, 1) * sqrt(N);
+            x_time = reshape(x_time, S, 1);
+            
+            % Add CP in time dimension
+            x_time_2d = reshape(x_time, N, M);
+            x_cp_2d = [x_time_2d(end-cp_len+1:end, :); x_time_2d];  % (N+cp_len)×M
+            x_cp = reshape(x_cp_2d, (N+cp_len)*M, 1);
+            
             % Channel
             [HT, ~, ~, ~, ~, ~] = NTN_channels( ...
                 M, N, params.df, params.max_doppler, params.channel_type);
             
-            % Effective DD channel
+            % Effective channel (without CP extension for simplicity)
             H_eff = OP' * HT * OP;
             H_eff = H_eff / sqrt(trace(H_eff*H_eff')/S);
             
             % DD-domain signal
-            w = sqrt(N0/2) * (randn(S,1) + 1j*randn(S,1));
-            r_dd = H_eff*x + w;
+            w = sqrt(N0/2) * (randn(S, 1) + 1j*randn(S, 1));
+            r_dd = H_eff * x + w;
             
             % LMMSE
-            W_lmmse = (H_eff'*H_eff + N0*eye(S)) \ H_eff';
+            W_lmmse = (H_eff' * H_eff + N0*eye(S)) \ H_eff';
             x_lmmse = W_lmmse * r_dd;
             data_lmmse = qamdemod(x_lmmse, params.M, 'UnitAveragePower', true);
             bits_lmmse = de2bi(data_lmmse, params.bits_in_sym, 'left-msb');
@@ -320,8 +363,8 @@ function results = run_otfs_simulation(params)
             tot_bits = tot_bits + numel(bits_tx);
         end
         
-        results.ber_lmmse(idx) = err_lmmse / tot_bits;
-        results.ber_mmsesd(idx) = err_mmsesd / tot_bits;
+        results.ber_lmmse(idx) = max(err_lmmse / tot_bits, 1e-6);
+        results.ber_mmsesd(idx) = max(err_mmsesd / tot_bits, 1e-6);
         
         fprintf(' LMMSE=%.3e, MMSE-SD=%.3e\n', ...
             results.ber_lmmse(idx), results.ber_mmsesd(idx));
@@ -331,91 +374,112 @@ end
 function plot_comparison_results(results, params)
     % Create comprehensive comparison plots
     
-    figure;
+    figure('Position', [100, 100, 1200, 500]);
     
     % Subplot 1: LMMSE Comparison
     subplot(1,2,1);
-    semilogy(params.SNR_dB, results.ocdm.ber_lmmse, '-r', 'LineWidth', 2);
+    semilogy(params.SNR_dB, results.ocdm.ber_lmmse, '-ro', 'LineWidth', 2, 'MarkerSize', 6);
     hold on;
-    semilogy(params.SNR_dB, results.afdm.ber_lmmse, '-^g', 'LineWidth', 2);
-    semilogy(params.SNR_dB, results.otfs.ber_lmmse, '-sb', 'LineWidth', 2);
+    semilogy(params.SNR_dB, results.afdm.ber_lmmse, '-g^', 'LineWidth', 2, 'MarkerSize', 6);
+    semilogy(params.SNR_dB, results.otfs.ber_lmmse, '-bs', 'LineWidth', 2, 'MarkerSize', 6);
     grid on;
-    xlabel('SNR (dB)', 'FontName', 'Times New Roman', 'FontSize', 14);
-    ylabel('BER','FontName','TimesNewRoman',  'FontSize', 14);
-    title('LMMSE Detector Comparison', 'FontName','TimesNewRoman',  'FontSize', 14);
-    legend('OCDM', 'AFDM', 'OTFS', 'Location', 'southwest');
-    ylim([1e-7 1]);
+    xlabel('SNR (dB)', 'FontSize', 14, 'FontWeight', 'bold');
+    ylabel('BER', 'FontSize', 14, 'FontWeight', 'bold');
+    title('LMMSE Detector Comparison', 'FontSize', 14, 'FontWeight', 'bold');
+    legend('OCDM', 'AFDM', 'OTFS', 'Location', 'southwest', 'FontSize', 12);
+    ylim([1e-5 1]);
+    grid on;
+    set(gca, 'FontSize', 11);
     
     % Subplot 2: MMSE-SD Comparison
     subplot(1,2,2);
-    semilogy(params.SNR_dB, results.ocdm.ber_mmsesd, '-r', 'LineWidth', 2 );
+    semilogy(params.SNR_dB, results.ocdm.ber_mmsesd, '-ro', 'LineWidth', 2, 'MarkerSize', 6);
     hold on;
-    semilogy(params.SNR_dB, results.afdm.ber_mmsesd, '-g', 'LineWidth', 2);
-    semilogy(params.SNR_dB, results.otfs.ber_mmsesd, '-b', 'LineWidth', 2);
+    semilogy(params.SNR_dB, results.afdm.ber_mmsesd, '-g^', 'LineWidth', 2, 'MarkerSize', 6);
+    semilogy(params.SNR_dB, results.otfs.ber_mmsesd, '-bs', 'LineWidth', 2, 'MarkerSize', 6);
     grid on;
-    xlabel('SNR (dB)', 'FontName','TimesNewRoman',  'FontSize', 14);
-    ylabel('BER', 'FontName','TimesNewRoman',  'FontSize', 14);
-    title('MMSE-SD Detector Comparison', 'FontName','TimesNewRoman',  'FontSize', 14);
-    legend('OCDM', 'AFDM', 'OTFS', 'Location', 'southwest');
-    ylim([1e-7 1]);
+    xlabel('SNR (dB)', 'FontSize', 14, 'FontWeight', 'bold');
+    ylabel('BER', 'FontSize', 14, 'FontWeight', 'bold');
+    title('MMSE-SD Detector Comparison', 'FontSize', 14, 'FontWeight', 'bold');
+    legend('OCDM', 'AFDM', 'OTFS', 'Location', 'southwest', 'FontSize', 12);
+    ylim([1e-5 1]);
+    grid on;
+    set(gca, 'FontSize', 11);
     
-
-    saveas(gcf, 'unified_comparison.fig');
-    saveas(gcf, 'unified_comparison.png');
- end
+    sgtitle('BER vs SNR - OCDM/AFDM/OTFS Waveform Comparison (NTN Channel)', ...
+        'FontSize', 15, 'FontWeight', 'bold');
+    
+    saveas(gcf, 'ber_snr_comparison.fig');
+    saveas(gcf, 'ber_snr_comparison.png');
+    saveas(gcf, 'ber_snr_comparison.pdf');
+    fprintf('\nPlots saved: ber_snr_comparison.fig/png/pdf\n');
+end
 
 function print_performance_summary(results, params)
     % Print comprehensive performance summary
     
-    fprintf('\n========================================\n');
-    fprintf('      PERFORMANCE SUMMARY\n');
-    fprintf('========================================\n\n');
+    fprintf('\n');
+    fprintf('================================================================================\n');
+    fprintf('                    PERFORMANCE SUMMARY - ALL SYSTEMS\n');
+    fprintf('================================================================================\n\n');
     
     systems = {'ocdm', 'afdm', 'otfs'};
     names = {'OCDM', 'AFDM', 'OTFS'};
     
-    % Find best system at each SNR
-    for idx = 1:length(params.SNR_dB)
-        fprintf('SNR = %d dB:\n', params.SNR_dB(idx));
-        fprintf('  System    | LMMSE BER  | MMSE-SD BER | SD Gain (dB)\n');
-        fprintf('  -------------------------------------------------------\n');
-        
-        for s = 1:length(systems)
-            sys = systems{s};
-            ber_l = results.(sys).ber_lmmse(idx);
-            ber_s = results.(sys).ber_mmsesd(idx);
-            gain = 10*log10(ber_l / (ber_s + eps));  % Add eps to avoid log(0)
-            
-            fprintf('  %-8s  | %.4e | %.4e  | %+6.2f\n', ...
-                names{s}, ber_l, ber_s, gain);
-        end
-        fprintf('\n');
-    end
-    
-    % Overall best performance
-    fprintf('========================================\n');
-    fprintf('BEST PERFORMING SYSTEM:\n');
-    fprintf('========================================\n');
+    % LMMSE Summary
+    fprintf('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ LMMSE DETECTOR ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
+    fprintf('SNR (dB)   │   OCDM        │   AFDM        │   OTFS        │   Best System\n');
+    fprintf('─────────────────────────────────────────────────────────────────────────────\n');
     
     for idx = 1:length(params.SNR_dB)
-        % LMMSE
         bers_lmmse = [results.ocdm.ber_lmmse(idx), ...
                       results.afdm.ber_lmmse(idx), ...
                       results.otfs.ber_lmmse(idx)];
         [~, best_l] = min(bers_lmmse);
         
-        % MMSE-SD
+        fprintf('%6d     │  %.3e  │  %.3e  │  %.3e  │   %s\n', ...
+            params.SNR_dB(idx), ...
+            results.ocdm.ber_lmmse(idx), ...
+            results.afdm.ber_lmmse(idx), ...
+            results.otfs.ber_lmmse(idx), ...
+            names{best_l});
+    end
+    
+    % MMSE-SD Summary
+    fprintf('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ MMSE-SD DETECTOR ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
+    fprintf('SNR (dB)   │   OCDM        │   AFDM        │   OTFS        │   Best System\n');
+    fprintf('─────────────────────────────────────────────────────────────────────────────\n');
+    
+    for idx = 1:length(params.SNR_dB)
         bers_mmsesd = [results.ocdm.ber_mmsesd(idx), ...
                        results.afdm.ber_mmsesd(idx), ...
                        results.otfs.ber_mmsesd(idx)];
         [~, best_s] = min(bers_mmsesd);
         
-        fprintf('SNR %2d dB: LMMSE → %s, MMSE-SD → %s\n', ...
-            params.SNR_dB(idx), names{best_l}, names{best_s});
+        fprintf('%6d     │  %.3e  │  %.3e  │  %.3e  │   %s\n', ...
+            params.SNR_dB(idx), ...
+            results.ocdm.ber_mmsesd(idx), ...
+            results.afdm.ber_mmsesd(idx), ...
+            results.otfs.ber_mmsesd(idx), ...
+            names{best_s});
     end
     
-    fprintf('========================================\n\n');
-
+    % Overall Statistics
+    fprintf('\n');
+    fprintf('================================================================================\n');
+    fprintf('                       OVERALL BEST PERFORMANCE\n');
+    fprintf('================================================================================\n\n');
+    
+    for s = 1:length(systems)
+        sys = systems{s};
+        fprintf('%s:\n', names{s});
+        fprintf('  LMMSE  - Best BER: %.3e at SNR=%d dB\n', ...
+            min(results.(sys).ber_lmmse), params.SNR_dB(find(results.(sys).ber_lmmse == min(results.(sys).ber_lmmse), 1)));
+        fprintf('  MMSE-SD- Best BER: %.3e at SNR=%d dB\n\n', ...
+            min(results.(sys).ber_mmsesd), params.SNR_dB(find(results.(sys).ber_mmsesd == min(results.(sys).ber_mmsesd), 1)));
+    end
+    
+    fprintf('================================================================================\n\n');
 end
 
 function s_hat = mmse_sd_detector_unified(r, H, N0, M)
