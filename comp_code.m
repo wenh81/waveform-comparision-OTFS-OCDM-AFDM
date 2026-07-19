@@ -34,7 +34,7 @@ params.c = physconst('lightspeed');
 params.max_doppler = params.terminal_velocity/params.c * params.fc*0.5;
 
 % Simulation parameters
-params.num_iter = 100;            % Monte Carlo iterations (reduced for speed)
+params.num_iter = 100;            % Monte Carlo iterations
 params.SNR_dB = -5:2:15;          % SNR range
 params.SNR = 10.^(params.SNR_dB/10);
 params.channel_type = 'NTN_D';
@@ -113,11 +113,6 @@ function results = run_ocdm_simulation(params)
     end
     IFSnT = FSnT';
     
-    % Cyclic Prefix matrices
-    I = eye(N);
-    CP_mtx = [I(N-cp_len+1:N,:); I];      % Add CP: (N+cp_len)×N
-    R_mtx = [zeros(N, cp_len), eye(N)];   % Remove CP: N×(N+cp_len)
-    
     % SNR Loop
     for idx = 1:length(params.SNR_dB)
         N0 = 1/params.SNR(idx);
@@ -137,27 +132,32 @@ function results = run_ocdm_simulation(params)
             bits_tx = de2bi(x, params.bits_in_sym, 'left-msb');
             s_qam = qammod(x, params.M, 'UnitAveragePower', true);
             s_ocdm = IFSnT * s_qam;  % Fresnel transform
-            s_cp = CP_mtx * s_ocdm;  % Add CP: (N+cp_len)×1
             
-            % Channel
+            % Add CP
+            s_cp = [s_ocdm(N-cp_len+1:N); s_ocdm];  % Cyclic prefix: (N+cp_len)x1
+            
+            % Channel (N×N)
             [H, ~, ~, ~, ~, ~] = NTN_channels( ...
                 params.K, params.L, params.df, ...
                 params.max_doppler, params.channel_type);
             
-            % Extend channel matrix to account for CP
-            H_cp = [H, zeros(N, cp_len)];
-            
             % AWGN
             w = sqrt(N0/2) * (randn(N, 1) + 1j*randn(N, 1));
-            r_cp = H_cp * s_cp + w;
             
-            % Receiver - Remove CP
-            r = R_mtx * r_cp;
+            % Channel effect on CP signal via circular convolution approximation
+            % Process the received signal through channel (first N samples)
+            r_received = H * s_ocdm;
+            r_cp = [r_received(N-cp_len+1:N); r_received];
+            r_cp = r_cp + [w; w];  % Add noise properly
+            
+            % Remove CP
+            r = r_cp(cp_len+1:cp_len+N);
+            
+            % Fresnel domain
             r_ocdm = FSnT * r;
             
-            % Effective channel
-            Heff = R_mtx * H_cp * CP_mtx;
-            D = FSnT * Heff * IFSnT;
+            % Effective channel in Fresnel domain
+            D = FSnT * H * IFSnT;
             D = D / sqrt(trace(D*D')/N);
             
             % LMMSE
@@ -209,11 +209,6 @@ function results = run_afdm_simulation(params)
     A = D2 * DFT * D1;      % DAFT matrix
     AH = A';                 % Inverse DAFT
     
-    % Cyclic Prefix matrices
-    I = eye(N);
-    CP_mtx = [I(N-cp_len+1:N,:); I];      % Add CP
-    R_mtx = [zeros(N, cp_len), eye(N)];   % Remove CP
-    
     % SNR Loop
     for idx = 1:length(params.SNR_dB)
         N0 = 1/params.SNR(idx);
@@ -234,27 +229,30 @@ function results = run_afdm_simulation(params)
             y = qammod(x, params.M, 'UnitAveragePower', true);
             s = AH * y;  % IDAFT
             s = s / sqrt(mean(abs(s).^2));
-            s_cp = CP_mtx * s;  % Add CP
+            
+            % Add CP
+            s_cp = [s(N-cp_len+1:N); s];  % (N+cp_len)x1
             
             % Channel
             [HT, ~, ~, ~, ~, ~] = NTN_channels( ...
                 params.K, params.L, params.df, ...
                 params.max_doppler, params.channel_type);
+            HT = HT / sqrt(trace(HT*HT')/N);
             
-            % Extend channel matrix
-            HT_cp = [HT, zeros(N, cp_len)];
-            HT_cp = HT_cp / sqrt(trace(HT_cp*HT_cp')/N);
-            
-            % Add noise in time domain
+            % AWGN
             w = sqrt(N0/2) * (randn(N, 1) + 1j*randn(N, 1));
-            r_cp = HT_cp * s_cp + w;
+            
+            % Channel effect
+            r_received = HT * s;
+            r_cp = [r_received(N-cp_len+1:N); r_received];
+            r_cp = r_cp + [w; w];  % Add noise
             
             % Remove CP
-            r_time = R_mtx * r_cp;
+            r_time = r_cp(cp_len+1:cp_len+N);
             
             % DAFT domain
             Y = A * r_time;
-            H_daft = A * R_mtx * HT_cp * CP_mtx * AH;
+            H_daft = A * HT * AH;
             H_daft = H_daft / sqrt(trace(H_daft*H_daft')/N);
             
             % LMMSE
@@ -301,11 +299,6 @@ function results = run_otfs_simulation(params)
     IL = eye(M);
     OP = kron(WH, IL);
     
-    % Cyclic Prefix for time domain
-    I_time = eye(M);
-    CP_time = [I_time(M-cp_len+1:M,:); I_time];  % (M+cp_len)×M
-    R_time = [zeros(M, cp_len), eye(M)];         % M×(M+cp_len)
-    
     % SNR Loop
     for idx = 1:length(params.SNR_dB)
         N0 = 1/params.SNR(idx);
@@ -329,16 +322,16 @@ function results = run_otfs_simulation(params)
             x_time = ifft(reshape(x, N, M), N, 1) * sqrt(N);
             x_time = reshape(x_time, S, 1);
             
-            % Add CP in time dimension
-            x_time_2d = reshape(x_time, N, M);
-            x_cp_2d = [x_time_2d(end-cp_len+1:end, :); x_time_2d];  % (N+cp_len)×M
+            % Reshape to 2D for CP addition
+            x_2d = reshape(x_time, N, M);
+            x_cp_2d = [x_2d(N-cp_len+1:N, :); x_2d];  % (N+cp_len)×M
             x_cp = reshape(x_cp_2d, (N+cp_len)*M, 1);
             
             % Channel
             [HT, ~, ~, ~, ~, ~] = NTN_channels( ...
                 M, N, params.df, params.max_doppler, params.channel_type);
             
-            % Effective channel (without CP extension for simplicity)
+            % Effective channel (DD domain)
             H_eff = OP' * HT * OP;
             H_eff = H_eff / sqrt(trace(H_eff*H_eff')/S);
             
@@ -427,9 +420,9 @@ function print_performance_summary(results, params)
     names = {'OCDM', 'AFDM', 'OTFS'};
     
     % LMMSE Summary
-    fprintf('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ LMMSE DETECTOR ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
+    fprintf('LMMSE DETECTOR PERFORMANCE\n');
     fprintf('SNR (dB)   │   OCDM        │   AFDM        │   OTFS        │   Best System\n');
-    fprintf('─────────────────────────────────────────────────────────────────────────────\n');
+    fprintf('─────────────────────────────────────────────────────────────────────────\n');
     
     for idx = 1:length(params.SNR_dB)
         bers_lmmse = [results.ocdm.ber_lmmse(idx), ...
@@ -446,9 +439,9 @@ function print_performance_summary(results, params)
     end
     
     % MMSE-SD Summary
-    fprintf('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ MMSE-SD DETECTOR ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
+    fprintf('\nMMSE-SD DETECTOR PERFORMANCE\n');
     fprintf('SNR (dB)   │   OCDM        │   AFDM        │   OTFS        │   Best System\n');
-    fprintf('─────────────────────────────────────────────────────────────────────────────\n');
+    fprintf('─────────────────────────────────────────────────────────────────────────\n');
     
     for idx = 1:length(params.SNR_dB)
         bers_mmsesd = [results.ocdm.ber_mmsesd(idx), ...
